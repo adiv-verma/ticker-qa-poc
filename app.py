@@ -16,13 +16,16 @@ with st.sidebar:
     st.caption("Ask about risks, liquidity, competition, supply chain, climate, lawsuits, outlook, etc.")
     st.markdown("---")
     st.caption("No paid market data used. LLM summarizes only the retrieved filing excerpts.")
+    st.markdown("---")
+    st.caption("Tip: If SEC rate limits, try again in ~1–2 minutes.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Secrets / environment
+# Secrets / environment (key is read only from Streamlit Secrets)
 # ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 if OPENAI_API_KEY:
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # so the OpenAI client can pick it up
+    # Optionally set env so legacy SDKs that read from env can pick it up
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SEC endpoints + REQUIRED header
@@ -176,26 +179,17 @@ def retrieve(question: str, vec, X, chunks: List[Dict], topk=5):
     return [{"text": chunks[i]["text"], "score": float(sims[i]), "source": chunks[i]["source"], "i": int(i)} for i in idx]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LLM summary (only uses retrieved passages)
+# LLM summary — version-agnostic OpenAI shim (key only from Secrets)
 # ──────────────────────────────────────────────────────────────────────────────
 def summarize_with_llm(question: str, passages: List[Dict]) -> Dict:
+    """
+    Uses OpenAI v1+ if available, else falls back to legacy v0.28.x.
+    Keeps API key exclusively in Streamlit Secrets.
+    """
     if not OPENAI_API_KEY:
         return {"answer": "(AI disabled: add OPENAI_API_KEY in Secrets)", "bullets": [], "citations": []}
 
-    try:
-        from openai import OpenAI
-        client = OpenAI()  # reads OPENAI_API_KEY from environment
-    except Exception as e:
-        return {"answer": f"(OpenAI init error: {e})", "bullets": [], "citations": []}
-
-    snippets = []
-    for p in passages:
-        snippets.append({
-            "id": p["i"],
-            "source": p["source"],
-            "excerpt": p["text"][:2000]  # keep prompt compact
-        })
-
+    snippets = [{"id": p["i"], "source": p["source"], "excerpt": p["text"][:2000]} for p in passages]
     system = (
         "You are an equity research assistant. Answer ONLY using the provided excerpts. "
         "Do not invent facts. Keep the answer concise and neutral. "
@@ -203,37 +197,59 @@ def summarize_with_llm(question: str, passages: List[Dict]) -> Dict:
         "citations (array of snippet ids used)."
     )
     user_payload = {"question": question, "snippets": snippets}
+    payload_json = json.dumps(user_payload)
 
+    # Try new SDK (v1+)
     try:
+        from openai import OpenAI as _OpenAI
+        client = _OpenAI(api_key=OPENAI_API_KEY)  # explicit to avoid env/proxy pitfalls
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user_payload)},
+                {"role": "user", "content": payload_json},
             ],
         )
-        data = resp.choices[0].message.content or "{}"
-        out = json.loads(data)
-        if "answer" not in out:
-            out["answer"] = ""
-        if "bullets" not in out or not isinstance(out["bullets"], list):
-            out["bullets"] = []
-        if "citations" not in out or not isinstance(out["citations"], list):
-            out["citations"] = []
-        return out
-    except Exception as e:
-        return {"answer": f"(LLM error: {e})", "bullets": [], "citations": []}
+        content = resp.choices[0].message.content or "{}"
+        out = json.loads(content)
+    except Exception:
+        # Fallback: legacy SDK (v0.28.x)
+        try:
+            import openai as _legacy
+            _legacy.api_key = OPENAI_API_KEY
+            resp = _legacy.ChatCompletion.create(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": payload_json},
+                ],
+            )
+            content = resp["choices"][0]["message"]["content"] if resp else "{}"
+            out = json.loads(content)
+        except Exception as e:
+            return {"answer": f"(LLM error: {e})", "bullets": [], "citations": []}
+
+    # Normalize output shape
+    if not isinstance(out, dict): out = {}
+    out.setdefault("answer", "")
+    out.setdefault("bullets", [])
+    out.setdefault("citations", [])
+    if not isinstance(out["bullets"], list): out["bullets"] = []
+    if not isinstance(out["citations"], list): out["citations"] = []
+    return out
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
-ticker = st.text_input("Ticker", "AAPL").upper().strip()
-question = st.text_input("Your question", "What risks are mentioned?")
-run = st.button("Search")
+with st.form(key="qa"):
+    ticker = st.text_input("Ticker", "AAPL").upper().strip()
+    question = st.text_input("Your question", "What risks are mentioned?")
+    submitted = st.form_submit_button("Search")
 
-if run:
+if submitted:
     try:
         if not ticker:
             st.warning("Please enter a ticker (e.g., AAPL, MSFT).")
