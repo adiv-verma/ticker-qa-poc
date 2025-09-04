@@ -1,36 +1,34 @@
-import os, re, time, requests, pandas as pd
+import os, re, time, json, requests, pandas as pd
 import streamlit as st
 from typing import List, Tuple, Dict
 from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from openai import OpenAI
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streamlit config
 # ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Ticker Q&A (POC)", page_icon="📄", layout="centered")
+st.set_page_config(page_title="Ticker Q&A — LLM + SEC Receipts", page_icon="📄", layout="centered")
 st.title("📄 Ticker Q&A — LLM Summary + SEC Receipts (Free Data)")
 
 with st.sidebar:
     st.markdown("**Data:** Official SEC EDGAR (10-K / 10-Q)")
-    st.caption("Ask: risks, liquidity, competition, supply chain, climate, lawsuits, outlook, etc.")
+    st.caption("Ask about risks, liquidity, competition, supply chain, climate, lawsuits, outlook, etc.")
     st.markdown("---")
-    st.caption("No paid data used. LLM summarizes the top matching paragraphs from the filing.")
+    st.caption("No paid market data used. LLM summarizes only the retrieved filing excerpts.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Secrets / API clients
+# Secrets / environment
 # ──────────────────────────────────────────────────────────────────────────────
-if "OPENAI_API_KEY" not in st.secrets:
-    st.warning("Admin: add OPENAI_API_KEY in Streamlit Secrets to enable AI summaries.")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+if OPENAI_API_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # so the OpenAI client can pick it up
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SEC endpoints + REQUIRED header
 # ──────────────────────────────────────────────────────────────────────────────
 EDGAR_API_BASE = "https://data.sec.gov"                    # submissions live here
-HEADERS = {"User-Agent": "nirvaanventuresllc@gmail.com"}   # SEC asks for contact in UA
+HEADERS = {"User-Agent": "nirvaanventuresllc@gmail.com"}   # SEC requests a contact email in UA
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP helpers with retries
@@ -71,10 +69,10 @@ def http_get_text(url: str, headers: dict, timeout: int = 60, retries: int = 3):
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def load_ticker_mapping() -> List[Dict]:
     """
-    Robust loader: SEC sometimes returns a list[...] or dict{"0":{...}} or {"data":[...]}.
+    Robust loader: SEC sometimes returns list[...] or dict{"0":{...}} or {"data":[...]}.
     We normalize to list[dict].
     """
-    url = "https://www.sec.gov/files/company_tickers.json"  # note: on www.sec.gov
+    url = "https://www.sec.gov/files/company_tickers.json"  # hosted on www.sec.gov
     raw = http_get_json(url, HEADERS, timeout=30)
 
     if isinstance(raw, list):
@@ -178,23 +176,24 @@ def retrieve(question: str, vec, X, chunks: List[Dict], topk=5):
     return [{"text": chunks[i]["text"], "score": float(sims[i]), "source": chunks[i]["source"], "i": int(i)} for i in idx]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LLM summary (uses only retrieved passages)
+# LLM summary (only uses retrieved passages)
 # ──────────────────────────────────────────────────────────────────────────────
 def summarize_with_llm(question: str, passages: List[Dict]) -> Dict:
-    """
-    Passages: list of {text, source, i}. We send only these to the model.
-    The model must summarize strictly from them and return JSON.
-    """
-    if not openai_client:
-        return {"answer": "(AI disabled: no OPENAI_API_KEY)", "bullets": [], "citations": []}
+    if not OPENAI_API_KEY:
+        return {"answer": "(AI disabled: add OPENAI_API_KEY in Secrets)", "bullets": [], "citations": []}
 
-    # Prepare compact context with numbered snippets
+    try:
+        from openai import OpenAI
+        client = OpenAI()  # reads OPENAI_API_KEY from environment
+    except Exception as e:
+        return {"answer": f"(OpenAI init error: {e})", "bullets": [], "citations": []}
+
     snippets = []
     for p in passages:
         snippets.append({
             "id": p["i"],
             "source": p["source"],
-            "excerpt": p["text"][:2000]  # keep prompt small; chunks are already ~900 chars
+            "excerpt": p["text"][:2000]  # keep prompt compact
         })
 
     system = (
@@ -205,21 +204,18 @@ def summarize_with_llm(question: str, passages: List[Dict]) -> Dict:
     )
     user_payload = {"question": question, "snippets": snippets}
 
-    resp = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": str(user_payload)}
-        ],
-    )
     try:
-        data = resp.choices[0].message.content
-        out = {}
-        import json
-        out = json.loads(data) if data else {}
-        # Basic shape guard
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user_payload)},
+            ],
+        )
+        data = resp.choices[0].message.content or "{}"
+        out = json.loads(data)
         if "answer" not in out:
             out["answer"] = ""
         if "bullets" not in out or not isinstance(out["bullets"], list):
@@ -228,7 +224,7 @@ def summarize_with_llm(question: str, passages: List[Dict]) -> Dict:
             out["citations"] = []
         return out
     except Exception as e:
-        return {"answer": f"(LLM parse error: {e})", "bullets": [], "citations": []}
+        return {"answer": f"(LLM error: {e})", "bullets": [], "citations": []}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
@@ -283,10 +279,15 @@ if run:
             for b in summary["bullets"][:5]:
                 st.markdown(f"- {b}")
 
-        # Show citation chips (map snippet ids → URLs)
+        # Citations mapped back to sources (dedup)
         if summary.get("citations"):
             st.caption("Citations:")
-            cited_ids = [int(x) for x in summary["citations"] if isinstance(x, (int, str)) and str(x).isdigit()]
+            cited_ids = []
+            for x in summary["citations"]:
+                try:
+                    cited_ids.append(int(x))
+                except Exception:
+                    pass
             seen = set()
             for p in hits:
                 if p["i"] in cited_ids and p["source"] not in seen:
