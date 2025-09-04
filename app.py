@@ -4,22 +4,33 @@ from typing import List, Tuple, Dict
 from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from openai import OpenAI
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Streamlit page config
+# Streamlit config
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Ticker Q&A (POC)", page_icon="📄", layout="centered")
-st.title("📄 Ticker Q&A (POC) — Free SEC Data")
+st.title("📄 Ticker Q&A — LLM Summary + SEC Receipts (Free Data)")
 
 with st.sidebar:
-    st.markdown("**Data source:** Official SEC EDGAR (10-K / 10-Q).")
-    st.caption("Ask about risks, liquidity, competition, supply chain, climate, lawsuits, etc.")
+    st.markdown("**Data:** Official SEC EDGAR (10-K / 10-Q)")
+    st.caption("Ask: risks, liquidity, competition, supply chain, climate, lawsuits, outlook, etc.")
+    st.markdown("---")
+    st.caption("No paid data used. LLM summarizes the top matching paragraphs from the filing.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Secrets / API clients
+# ──────────────────────────────────────────────────────────────────────────────
+if "OPENAI_API_KEY" not in st.secrets:
+    st.warning("Admin: add OPENAI_API_KEY in Streamlit Secrets to enable AI summaries.")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SEC endpoints + REQUIRED header
 # ──────────────────────────────────────────────────────────────────────────────
-EDGAR_API_BASE = "https://data.sec.gov"                       # submissions live here
-HEADERS = {"User-Agent": "nirvaanventuresllc@gmail.com"}      # <- your email (required by SEC)
+EDGAR_API_BASE = "https://data.sec.gov"                    # submissions live here
+HEADERS = {"User-Agent": "nirvaanventuresllc@gmail.com"}   # SEC asks for contact in UA
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP helpers with retries
@@ -55,22 +66,20 @@ def http_get_text(url: str, headers: dict, timeout: int = 60, retries: int = 3):
     raise RuntimeError(f"Failed to GET text from {url}: {last_err}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core SEC helpers
+# SEC helpers
 # ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)  # cache 6h
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def load_ticker_mapping() -> List[Dict]:
     """
-    Robustly load the SEC ticker -> CIK mapping.
-    SEC sometimes serves this as a list[...] or as a dict{"0": {...}, ...}.
+    Robust loader: SEC sometimes returns a list[...] or dict{"0":{...}} or {"data":[...]}.
+    We normalize to list[dict].
     """
-    url = "https://www.sec.gov/files/company_tickers.json"  # note: on www.sec.gov, not data.sec.gov
+    url = "https://www.sec.gov/files/company_tickers.json"  # note: on www.sec.gov
     raw = http_get_json(url, HEADERS, timeout=30)
 
-    # Normalize into a list[dict]
     if isinstance(raw, list):
         items = raw
     elif isinstance(raw, dict):
-        # Some variants: {"0": {...}, "1": {...}}  OR  {"data": [ {...}, ... ]}
         if "data" in raw and isinstance(raw["data"], list):
             items = raw["data"]
         else:
@@ -78,42 +87,32 @@ def load_ticker_mapping() -> List[Dict]:
     else:
         items = []
 
-    # Ensure minimal keys exist; filter out any malformed rows
     out = []
     for obj in items:
-        if not isinstance(obj, dict):
-            continue
-        # Expected keys: ticker, cik_str, title
-        if "ticker" in obj and "cik_str" in obj:
+        if isinstance(obj, dict) and "ticker" in obj and "cik_str" in obj:
             out.append(obj)
     if not out:
         raise RuntimeError("SEC ticker mapping is empty or malformed. Try again later.")
     return out
 
-@st.cache_data(show_spinner=False, ttl=60 * 30)  # cache 30m
+@st.cache_data(show_spinner=False, ttl=60 * 30)
 def get_cik_and_recent(symbol: str) -> Tuple[str, pd.DataFrame]:
     mapping = load_ticker_mapping()
     sym = symbol.upper()
-
-    # Lookup (case-insensitive)
     match = next((row for row in mapping if str(row.get("ticker", "")).upper() == sym), None)
     if not match:
         raise ValueError(f"Ticker {sym} not found in SEC mapping.")
-
     cik = str(match["cik_str"]).zfill(10)
+
     sub_url = f"{EDGAR_API_BASE}/submissions/CIK{cik}.json"
     submissions = http_get_json(sub_url, HEADERS, timeout=30)
-
     recent = submissions.get("filings", {}).get("recent", {})
     df = pd.DataFrame(recent) if recent else pd.DataFrame()
 
-    # Coerce to strings to avoid weird dtype issues when indexing
     if not df.empty:
         for col in ("accessionNumber", "primaryDocument", "form", "filingDate"):
             if col in df.columns:
                 df[col] = df[col].astype(str)
-
-        # Make sure most recent is first (filings.recent usually already is)
         if "filingDate" in df.columns:
             try:
                 df = df.sort_values("filingDate", ascending=False)
@@ -123,7 +122,6 @@ def get_cik_and_recent(symbol: str) -> Tuple[str, pd.DataFrame]:
     return cik, df
 
 def latest_filing_urls(cik: str, df_recent: pd.DataFrame, forms=("10-K", "10-Q")) -> List[Tuple[str, str]]:
-    """Return [(FORM, url_to_primary_doc_html)] for the most recent of each requested form."""
     out = []
     if df_recent is None or df_recent.empty:
         return out
@@ -142,13 +140,12 @@ def clean_html_to_text(html: str) -> str:
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     text = soup.get_text(separator="\n")
-    text = re.sub(r"\u00A0", " ", text)      # non-breaking spaces
-    text = re.sub(r"[ \t]+", " ", text)      # collapse spaces
-    text = re.sub(r"\n{2,}", "\n\n", text)   # tidy newlines
+    text = re.sub(r"\u00A0", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n\n", text)
     return text.strip()
 
 def chunk_text_with_source(text: str, source_url: str, size=900, overlap=150) -> List[Dict]:
-    """Split text into overlapping chunks and keep per-chunk source."""
     chunks = []
     start = 0
     N = len(text)
@@ -166,7 +163,7 @@ def chunk_text_with_source(text: str, source_url: str, size=900, overlap=150) ->
     return chunks
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Retrieval (TF-IDF) helpers
+# Retrieval (TF-IDF)
 # ──────────────────────────────────────────────────────────────────────────────
 def build_index(chunks: List[Dict]):
     texts = [c["text"] for c in chunks]
@@ -178,7 +175,60 @@ def retrieve(question: str, vec, X, chunks: List[Dict], topk=5):
     qv = vec.transform([question])
     sims = cosine_similarity(qv, X).ravel()
     idx = sims.argsort()[::-1][:topk]
-    return [{"text": chunks[i]["text"], "score": float(sims[i]), "source": chunks[i]["source"]} for i in idx]
+    return [{"text": chunks[i]["text"], "score": float(sims[i]), "source": chunks[i]["source"], "i": int(i)} for i in idx]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM summary (uses only retrieved passages)
+# ──────────────────────────────────────────────────────────────────────────────
+def summarize_with_llm(question: str, passages: List[Dict]) -> Dict:
+    """
+    Passages: list of {text, source, i}. We send only these to the model.
+    The model must summarize strictly from them and return JSON.
+    """
+    if not openai_client:
+        return {"answer": "(AI disabled: no OPENAI_API_KEY)", "bullets": [], "citations": []}
+
+    # Prepare compact context with numbered snippets
+    snippets = []
+    for p in passages:
+        snippets.append({
+            "id": p["i"],
+            "source": p["source"],
+            "excerpt": p["text"][:2000]  # keep prompt small; chunks are already ~900 chars
+        })
+
+    system = (
+        "You are an equity research assistant. Answer ONLY using the provided excerpts. "
+        "Do not invent facts. Keep the answer concise and neutral. "
+        "Return JSON with keys: answer (string), bullets (array of strings, max 5), "
+        "citations (array of snippet ids used)."
+    )
+    user_payload = {"question": question, "snippets": snippets}
+
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": str(user_payload)}
+        ],
+    )
+    try:
+        data = resp.choices[0].message.content
+        out = {}
+        import json
+        out = json.loads(data) if data else {}
+        # Basic shape guard
+        if "answer" not in out:
+            out["answer"] = ""
+        if "bullets" not in out or not isinstance(out["bullets"], list):
+            out["bullets"] = []
+        if "citations" not in out or not isinstance(out["citations"], list):
+            out["citations"] = []
+        return out
+    except Exception as e:
+        return {"answer": f"(LLM parse error: {e})", "bullets": [], "citations": []}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
@@ -205,7 +255,7 @@ if run:
             st.warning("Couldn't find a recent 10-K or 10-Q for this ticker.")
             st.stop()
 
-        # 3) Fetch docs & build corpus
+        # 3) Fetch documents & build corpus
         all_chunks: List[Dict] = []
         for form, url in urls:
             with st.spinner(f"Fetching {form}…"):
@@ -221,10 +271,34 @@ if run:
         vec, X = build_index(all_chunks)
         hits = retrieve(question, vec, X, all_chunks, topk=5)
 
-        # 5) Display
-        st.subheader("Top excerpts from SEC filing")
+        # 5) LLM summary on top passages
+        with st.spinner("Generating AI summary…"):
+            summary = summarize_with_llm(question, hits)
+
+        # 6) Render — LLM summary first
+        st.subheader("AI Summary")
+        st.write(summary.get("answer", "").strip() or "(no summary)")
+        if summary.get("bullets"):
+            st.markdown("**Key points:**")
+            for b in summary["bullets"][:5]:
+                st.markdown(f"- {b}")
+
+        # Show citation chips (map snippet ids → URLs)
+        if summary.get("citations"):
+            st.caption("Citations:")
+            cited_ids = [int(x) for x in summary["citations"] if isinstance(x, (int, str)) and str(x).isdigit()]
+            seen = set()
+            for p in hits:
+                if p["i"] in cited_ids and p["source"] not in seen:
+                    st.markdown(f"- [{p['source']}]({p['source']})")
+                    seen.add(p["source"])
+
+        st.divider()
+
+        # 7) Receipts — exact filing excerpts
+        st.subheader("Supporting excerpts from SEC filing")
         for h in hits:
-            st.write(f"**Relevance:** {h['score']:.3f}")
+            st.write(f"**Relevance:** {h['score']:.3f}  •  Snippet ID: {h['i']}")
             st.markdown(f"> {h['text']}")
             st.caption(f"Source: {h['source']}")
             st.divider()
