@@ -245,9 +245,10 @@ def summarize_with_llm(question: str, passages: List[Dict]) -> Dict:
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 with st.form(key="qa"):
-    ticker = st.text_input("Ticker", "AAPL").upper().strip()
-    question = st.text_input("Your question", "What risks are mentioned?")
+    ticker = st.text_input("Ticker", "NVDA").upper().strip()
+    question = st.text_input("Your question", "Summarize overall earnings, cash flow and debt").strip()
     submitted = st.form_submit_button("Search")
+
 
 if submitted:
     try:
