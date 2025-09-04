@@ -1,0 +1,6 @@
+streamlit==1.37.1
+pandas
+requests
+beautifulsoup4
+scikit-learn
+lxml
