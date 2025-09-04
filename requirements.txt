@@ -1,7 +1,8 @@
-streamlit==1.37.1
-pandas
-requests
-beautifulsoup4
-scikit-learn
-lxml
-openai==1.43.0
+streamlit>=1.36
+requests>=2.31
+pandas>=2.2
+beautifulsoup4>=4.12
+lxml>=5.2
+scikit-learn>=1.4
+openai>=1.51.0,<2
+httpx>=0.27
