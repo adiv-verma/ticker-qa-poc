@@ -13,17 +13,16 @@ st.title("📄 Ticker Q&A (POC) — Free SEC Data")
 
 with st.sidebar:
     st.markdown("**Data source:** Official SEC EDGAR (10-K / 10-Q).")
-    st.caption("Tip: Ask about risks, liquidity, competition, supply chain, climate, lawsuits, etc.")
+    st.caption("Ask about risks, liquidity, competition, supply chain, climate, lawsuits, etc.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SEC endpoints + REQUIRED header
-# IMPORTANT: SEC requires a User-Agent with contact info.
 # ──────────────────────────────────────────────────────────────────────────────
-EDGAR_API_BASE = "https://data.sec.gov"           # submissions live here
-HEADERS = {"User-Agent": "nirvaanventuresllc@gmail.com"}  # <- your email
+EDGAR_API_BASE = "https://data.sec.gov"                       # submissions live here
+HEADERS = {"User-Agent": "nirvaanventuresllc@gmail.com"}      # <- your email (required by SEC)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP helpers with retries (handle rate limiting / transient 5xx)
+# HTTP helpers with retries
 # ──────────────────────────────────────────────────────────────────────────────
 def http_get_json(url: str, headers: dict, timeout: int = 30, retries: int = 3):
     last_err = None
@@ -60,25 +59,68 @@ def http_get_text(url: str, headers: dict, timeout: int = 60, retries: int = 3):
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)  # cache 6h
 def load_ticker_mapping() -> List[Dict]:
-    # NOTE: company_tickers.json is hosted on *www.sec.gov*, not data.sec.gov
-    url = "https://www.sec.gov/files/company_tickers.json"
-    mapping = http_get_json(url, HEADERS, timeout=30)
-    # [{"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...]
-    return mapping
+    """
+    Robustly load the SEC ticker -> CIK mapping.
+    SEC sometimes serves this as a list[...] or as a dict{"0": {...}, ...}.
+    """
+    url = "https://www.sec.gov/files/company_tickers.json"  # note: on www.sec.gov, not data.sec.gov
+    raw = http_get_json(url, HEADERS, timeout=30)
+
+    # Normalize into a list[dict]
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        # Some variants: {"0": {...}, "1": {...}}  OR  {"data": [ {...}, ... ]}
+        if "data" in raw and isinstance(raw["data"], list):
+            items = raw["data"]
+        else:
+            items = list(raw.values())
+    else:
+        items = []
+
+    # Ensure minimal keys exist; filter out any malformed rows
+    out = []
+    for obj in items:
+        if not isinstance(obj, dict):
+            continue
+        # Expected keys: ticker, cik_str, title
+        if "ticker" in obj and "cik_str" in obj:
+            out.append(obj)
+    if not out:
+        raise RuntimeError("SEC ticker mapping is empty or malformed. Try again later.")
+    return out
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)  # cache 30m
 def get_cik_and_recent(symbol: str) -> Tuple[str, pd.DataFrame]:
     mapping = load_ticker_mapping()
     sym = symbol.upper()
-    for row in mapping:
-        if row.get("ticker", "").upper() == sym:
-            cik = str(row["cik_str"]).zfill(10)
-            sub_url = f"{EDGAR_API_BASE}/submissions/CIK{cik}.json"
-            submissions = http_get_json(sub_url, HEADERS, timeout=30)
-            filings = submissions.get("filings", {}).get("recent", {})
-            df = pd.DataFrame(filings) if filings else pd.DataFrame()
-            return cik, df
-    raise ValueError(f"Ticker {sym} not found in SEC mapping.")
+
+    # Lookup (case-insensitive)
+    match = next((row for row in mapping if str(row.get("ticker", "")).upper() == sym), None)
+    if not match:
+        raise ValueError(f"Ticker {sym} not found in SEC mapping.")
+
+    cik = str(match["cik_str"]).zfill(10)
+    sub_url = f"{EDGAR_API_BASE}/submissions/CIK{cik}.json"
+    submissions = http_get_json(sub_url, HEADERS, timeout=30)
+
+    recent = submissions.get("filings", {}).get("recent", {})
+    df = pd.DataFrame(recent) if recent else pd.DataFrame()
+
+    # Coerce to strings to avoid weird dtype issues when indexing
+    if not df.empty:
+        for col in ("accessionNumber", "primaryDocument", "form", "filingDate"):
+            if col in df.columns:
+                df[col] = df[col].astype(str)
+
+        # Make sure most recent is first (filings.recent usually already is)
+        if "filingDate" in df.columns:
+            try:
+                df = df.sort_values("filingDate", ascending=False)
+            except Exception:
+                pass
+
+    return cik, df
 
 def latest_filing_urls(cik: str, df_recent: pd.DataFrame, forms=("10-K", "10-Q")) -> List[Tuple[str, str]]:
     """Return [(FORM, url_to_primary_doc_html)] for the most recent of each requested form."""
@@ -88,7 +130,7 @@ def latest_filing_urls(cik: str, df_recent: pd.DataFrame, forms=("10-K", "10-Q")
     for form in forms:
         rows = df_recent[df_recent["form"] == form]
         if not rows.empty:
-            row = rows.iloc[0]  # most recent entry for that form
+            row = rows.iloc[0]
             acc_no = row["accessionNumber"].replace("-", "")
             primary_doc = row["primaryDocument"]
             filing_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no}/{primary_doc}"
@@ -124,7 +166,7 @@ def chunk_text_with_source(text: str, source_url: str, size=900, overlap=150) ->
     return chunks
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Retrieval functions
+# Retrieval (TF-IDF) helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def build_index(chunks: List[Dict]):
     texts = [c["text"] for c in chunks]
