@@ -10,7 +10,7 @@ st.title("📄 Ticker Q&A (POC) — Free SEC Data")
 
 # ---- SEC helpers ----
 SEC_BASE = "https://data.sec.gov"
-HEADERS = {"User-Agent": "yourname@example.com"}  # replace with your email
+HEADERS = {"User-Agent": "nirvaanventuresllc@gmail.com"}  # replace with your email
 
 def get_cik_and_filings(symbol: str):
     mapping = requests.get(f"{SEC_BASE}/files/company_tickers.json", headers=HEADERS, timeout=30).json()
